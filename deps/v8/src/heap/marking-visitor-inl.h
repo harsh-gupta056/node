@@ -89,7 +89,7 @@ void MarkingVisitorBase<ConcreteVisitor>::ProcessStrongHeapObject(
         reinterpret_cast<void*>(host->address()),
         reinterpret_cast<void*>(slot.address()),
         reinterpret_cast<void*>(
-            MemoryChunkMetadata::FromHeapObject(heap_->isolate(), heap_object)
+            BasePage::FromHeapObject(heap_->isolate(), heap_object)
                 ->owner()
                 ->identity()));
   }
@@ -236,41 +236,59 @@ void MarkingVisitorBase<ConcreteVisitor>::VisitExternalPointer(
     Tagged<HeapObject> host, ExternalPointerSlot slot) {
 #ifdef V8_COMPRESS_POINTERS
   DCHECK(!slot.tag_range().IsEmpty());
-  if (slot.HasExternalPointerHandle()) {
-    ExternalPointerHandle handle = slot.Relaxed_LoadHandle();
-    ExternalPointerTable* table;
-    ExternalPointerTable::Space* space;
-    if (IsSharedExternalPointerType(slot.tag_range())) {
-      table = shared_external_pointer_table_;
-      space = shared_external_pointer_space_;
-    } else {
-      table = external_pointer_table_;
-      if (v8_flags.sticky_mark_bits) {
-        // Everything is considered old during major GC.
-        DCHECK(!HeapLayout::InYoungGeneration(host));
-        if (handle == kNullExternalPointerHandle) return;
-        // The object may either be in young or old EPT.
-        if (table->Contains(heap_->young_external_pointer_space(), handle)) {
-          space = heap_->young_external_pointer_space();
-        } else {
-          DCHECK(table->Contains(heap_->old_external_pointer_space(), handle));
-          space = heap_->old_external_pointer_space();
-        }
-      } else {
-        space = HeapLayout::InYoungGeneration(host)
-                    ? heap_->young_external_pointer_space()
-                    : heap_->old_external_pointer_space();
-      }
-    }
-    table->Mark(space, handle, slot.address());
+  if (!slot.HasExternalPointerHandle()) {
+    return;
   }
-#endif  // V8_COMPRESS_POINTERS
+  const ExternalPointerHandle handle = slot.Relaxed_LoadHandle();
+  ExternalPointerTable* table;
+  ExternalPointerTable::Space* space;
+  if (IsSharedExternalPointerType(slot.tag_range())) {
+    table = shared_external_pointer_table_;
+    space = shared_external_pointer_space_;
+  } else {
+    table = external_pointer_table_;
+    if constexpr (v8_flags.sticky_mark_bits.value()) {
+      // Everything is considered old during major GC.
+      DCHECK(!HeapLayout::InYoungGeneration(host));
+      if (handle == kNullExternalPointerHandle) return;
+      // The object may either be in young or old EPT.
+      if (table->Contains(heap_->young_external_pointer_space(), handle)) {
+        space = heap_->young_external_pointer_space();
+      } else {
+        DCHECK(table->Contains(heap_->old_external_pointer_space(), handle));
+        space = heap_->old_external_pointer_space();
+      }
+    } else {
+      space = HeapLayout::InYoungGeneration(host)
+                  ? heap_->young_external_pointer_space()
+                  : heap_->old_external_pointer_space();
+    }
+  }
+  table->Mark(space, handle, slot.address());
+  if (slot.tag_range() != kArrayBufferExtensionTag) {
+    return;
+  }
+  Address maybe_extension = table->Get(handle, slot.tag_range());
+#else   // !V8_COMPRESS_POINTERS
+  if (slot.tag_range() != kArrayBufferExtensionTag) {
+    return;
+  }
+  Address maybe_extension = slot.load(heap_->isolate());
+#endif  // !V8_COMPRESS_POINTERS
+  if (maybe_extension) {
+    ArrayBufferExtension* extension =
+        reinterpret_cast<ArrayBufferExtension*>(maybe_extension);
+    extension->InitializationBarrier();
+    extension->Mark();
+  }
 }
 
 template <typename ConcreteVisitor>
 void MarkingVisitorBase<ConcreteVisitor>::VisitCppHeapPointer(
     Tagged<HeapObject> host, CppHeapPointerSlot slot) {
 #ifdef V8_COMPRESS_POINTERS
+  // It's crucial to only load the handle here once and avoid a double-fetch to
+  // make sure that a handle (slot) has its corresponding object marked as well.
   const ExternalPointerHandle handle = slot.Relaxed_LoadHandle();
   if (handle == kNullExternalPointerHandle) {
     return;
@@ -278,9 +296,11 @@ void MarkingVisitorBase<ConcreteVisitor>::VisitCppHeapPointer(
   CppHeapPointerTable* table = cpp_heap_pointer_table_;
   CppHeapPointerTable::Space* space = heap_->cpp_heap_pointer_space();
   table->Mark(space, handle, slot.address());
-#endif  // V8_COMPRESS_POINTERS
-  if (auto cpp_heap_pointer =
-          slot.try_load(heap_->isolate(), kAnyCppHeapPointer)) {
+  Address cpp_heap_pointer = table->Get(handle, kAnyCppHeapPointer);
+#else   // !V8_COMPRESS_POINTERS
+  Address cpp_heap_pointer = slot.load();
+#endif  // !V8_COMPRESS_POINTERS
+  if (cpp_heap_pointer) {
     local_marking_worklists_->cpp_marking_state()->MarkAndPush(
         reinterpret_cast<void*>(cpp_heap_pointer));
   }
@@ -648,24 +668,12 @@ size_t MarkingVisitorBase<ConcreteVisitor>::VisitFixedArray(
     Tagged<Map> map, Tagged<FixedArray> object,
     MaybeObjectSize maybe_object_size) {
   MarkingProgressTracker& progress_tracker =
-      MutablePageMetadata::FromHeapObject(heap_->isolate(), object)
+      MutablePage::FromHeapObject(heap_->isolate(), object)
           ->marking_progress_tracker();
   return concrete_visitor()->CanUpdateValuesInHeap() &&
                  progress_tracker.IsEnabled()
              ? VisitFixedArrayWithProgressTracker(map, object, progress_tracker)
              : Base::VisitFixedArray(map, object, maybe_object_size);
-}
-
-// ===========================================================================
-// Custom visitation =========================================================
-// ===========================================================================
-
-template <typename ConcreteVisitor>
-size_t MarkingVisitorBase<ConcreteVisitor>::VisitJSArrayBuffer(
-    Tagged<Map> map, Tagged<JSArrayBuffer> object,
-    MaybeObjectSize maybe_object_size) {
-  object->MarkExtension();
-  return Base::VisitJSArrayBuffer(map, object, maybe_object_size);
 }
 
 // ===========================================================================

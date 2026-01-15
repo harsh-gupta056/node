@@ -1213,18 +1213,18 @@ Maybe<bool> ValueSerializer::WriteWasmModule(
 
 Maybe<bool> ValueSerializer::WriteWasmMemory(
     DirectHandle<WasmMemoryObject> object) {
-  if (!object->array_buffer()->is_shared()) {
+  DirectHandle<JSArrayBuffer> shared_ab =
+      WasmMemoryObject::GetArrayBuffer(isolate_, object);
+  if (!shared_ab->is_shared()) {
     return ThrowDataCloneError(MessageTemplate::kDataCloneError, object);
   }
 
-  GlobalBackingStoreRegistry::Register(
-      object->array_buffer()->GetBackingStore());
+  GlobalBackingStoreRegistry::Register(shared_ab->GetBackingStore());
 
   WriteTag(SerializationTag::kWasmMemoryTransfer);
   WriteZigZag<int32_t>(object->maximum_pages());
   WriteByte(object->is_memory64() ? 1 : 0);
-  return WriteJSReceiver(
-      DirectHandle<JSReceiver>(object->array_buffer(), isolate_));
+  return WriteJSReceiver(shared_ab);
 }
 #endif  // V8_ENABLE_WEBASSEMBLY
 
@@ -2147,6 +2147,16 @@ MaybeDirectHandle<JSArrayBuffer> ValueDeserializer::ReadJSArrayBuffer(
           break;
         case WasmMemoryArrayBufferTag::kResizableFollowedByWasmMemory: {
           array_buffer->set_is_resizable_by_js(true);
+          // Update the byte_length at the same time as the flag to keep
+          // consistent state. The ByteLength is also post-processed after
+          // the creation of the memory object, which should take care of the
+          // most common case. Updating the flag, but not the byte_length is
+          // inconsistent for the buffer object and causes DCHECKS fails.
+          uint32_t byte_length;
+          if (!ReadVarint<uint32_t>().To(&byte_length)) {
+            return MaybeDirectHandle<JSArrayBuffer>();
+          }
+          array_buffer->set_byte_length(byte_length);
           DirectHandle<Object> wasm_memory_obj;
           if (!ReadObject().ToHandle(&wasm_memory_obj) ||
               !IsWasmMemoryObject(*wasm_memory_obj, isolate_)) {
@@ -2456,8 +2466,8 @@ MaybeDirectHandle<WasmMemoryObject> ValueDeserializer::ReadWasmMemory() {
   DirectHandle<JSArrayBuffer> buffer = Cast<JSArrayBuffer>(buffer_object);
   if (!buffer->is_shared()) return {};
 
-  DirectHandle<WasmMemoryObject> result =
-      WasmMemoryObject::New(isolate_, buffer, maximum_pages, address_type);
+  DirectHandle<WasmMemoryObject> result = WasmMemoryObject::New(
+      isolate_, buffer, buffer->GetBackingStore(), maximum_pages, address_type);
 
   AddObjectWithID(id, result);
   return result;

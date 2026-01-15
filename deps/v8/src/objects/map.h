@@ -84,6 +84,7 @@ enum InstanceType : uint16_t;
   V(PropertyArray)                    \
   V(PropertyCell)                     \
   V(PrototypeInfo)                    \
+  V(PrototypeSharedClosureInfo)       \
   V(RegExpBoilerplateDescription)     \
   V(RegExpDataWrapper)                \
   V(SharedFunctionInfo)               \
@@ -453,6 +454,10 @@ class Map : public TorqueGeneratedMap<Map, HeapObject> {
   inline bool is_abandoned_prototype_map() const;
   inline bool has_prototype_info() const;
   inline bool TryGetPrototypeInfo(Tagged<PrototypeInfo>* result) const;
+  inline bool TryGetPrototypeSharedClosureInfo(
+      Tagged<PrototypeSharedClosureInfo>* result) const;
+  inline void SetPrototypeSharedClosureInfo(
+      Tagged<PrototypeSharedClosureInfo> closure_infos);
 
   // Whether the instance has been added to the retained map list by
   // Heap::AddRetainedMap.
@@ -506,9 +511,12 @@ class Map : public TorqueGeneratedMap<Map, HeapObject> {
       raw_transitions, Tagged<UnionOf<Smi, MaybeWeak<Map>, TransitionArray>>)
   // [prototype_info]: Per-prototype metadata. Aliased with transitions
   // (which prototype maps don't have).
-  DECL_GETTER(prototype_info, Tagged<UnionOf<Smi, PrototypeInfo>>)
-  DECL_RELEASE_ACQUIRE_ACCESSORS(prototype_info,
-                                 Tagged<UnionOf<Smi, PrototypeInfo>>)
+  DECL_GETTER(prototype_info,
+              Tagged<UnionOf<Smi, PrototypeInfo, PrototypeSharedClosureInfo>>)
+
+  DECL_RELEASE_ACQUIRE_ACCESSORS(
+      prototype_info,
+      Tagged<UnionOf<Smi, PrototypeInfo, PrototypeSharedClosureInfo>>)
   // PrototypeInfo is created lazily using this helper (which installs it on
   // the given prototype's map).
   static DirectHandle<PrototypeInfo> GetOrCreatePrototypeInfo(
@@ -1070,6 +1078,14 @@ class Map : public TorqueGeneratedMap<Map, HeapObject> {
   static Handle<Map> CopyAddDescriptor(Isolate* isolate, DirectHandle<Map> map,
                                        Descriptor* descriptor,
                                        TransitionFlag flag);
+
+  template <typename InitMapCb>
+  static Handle<Map> CopyReplaceDescriptors(
+      Isolate* isolate, DirectHandle<Map> map,
+      DirectHandle<DescriptorArray> descriptors, TransitionFlag flag,
+      const InitMapCb& InitMap, MaybeDirectHandle<Name> maybe_name,
+      const char* reason, TransitionKindFlag transition_kind);
+
   static Handle<Map> CopyReplaceDescriptors(
       Isolate* isolate, DirectHandle<Map> map,
       DirectHandle<DescriptorArray> descriptors, TransitionFlag flag,
@@ -1084,6 +1100,7 @@ class Map : public TorqueGeneratedMap<Map, HeapObject> {
                                     PropertyNormalizationMode mode);
 
   void DeprecateTransitionTree(Isolate* isolate);
+  void DeprecateTransitionTreeImpl(Isolate* isolate);
 
   void ReplaceDescriptors(Isolate* isolate,
                           Tagged<DescriptorArray> new_descriptors);

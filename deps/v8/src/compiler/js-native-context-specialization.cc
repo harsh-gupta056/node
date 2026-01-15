@@ -147,10 +147,7 @@ Reduction JSNativeContextSpecialization::Reduce(Node* node) {
 std::optional<size_t> JSNativeContextSpecialization::GetMaxStringLength(
     JSHeapBroker* broker, Node* node) {
   HeapObjectMatcher matcher(node);
-  if (matcher.HasResolvedValue() &&
-      !matcher.Is(
-          broker->local_isolate_or_isolate()->factory()->the_hole_value()) &&
-      matcher.Ref(broker).IsString()) {
+  if (matcher.HasResolvedValue() && matcher.Ref(broker).IsString()) {
     StringRef input = matcher.Ref(broker).AsString();
     return input.length();
   }
@@ -3954,7 +3951,9 @@ JSNativeContextSpecialization::
         simplified()->NumberEqual(),
         graph()->NewNode(
             simplified()->NumberBitwiseAnd(), buffer_bit_field,
-            jsgraph()->ConstantNoHole(JSArrayBuffer::WasDetachedBit::kMask)),
+            jsgraph()->ConstantNoHole(JSArrayBuffer::NotValidMask(
+                keyed_mode.IsStore() ? TypedArrayAccessMode::kWrite
+                                     : TypedArrayAccessMode::kRead))),
         jsgraph()->ZeroConstant());
     effect = graph()->NewNode(
         simplified()->CheckIf(DeoptimizeReason::kArrayBufferWasDetached), check,
@@ -4337,9 +4336,17 @@ Node* JSNativeContextSpecialization::BuildCheckEqualsName(NameRef name,
                                                           Node* effect,
                                                           Node* control) {
   DCHECK(name.IsUniqueName());
-  Operator const* const op =
-      name.IsSymbol() ? simplified()->CheckEqualsSymbol()
-                      : simplified()->CheckEqualsInternalizedString();
+  Operator const* op;
+  if (name.IsSymbol()) {
+    op = simplified()->CheckEqualsSymbol();
+    // CheckEqualsSymbol is really just a TaggedEqual and will just return false
+    // if {value} is not a Symbol.
+  } else {
+    DCHECK(name.IsString());
+    op = simplified()->CheckEqualsInternalizedString();
+    effect = graph()->NewNode(simplified()->CheckString(FeedbackSource()),
+                              value, effect, control);
+  }
   return graph()->NewNode(op, jsgraph()->ConstantNoHole(name, broker()), value,
                           effect, control);
 }

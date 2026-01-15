@@ -64,6 +64,7 @@ std::optional<Tagged<JSFunction>> Map::GetConstructorFunction(
   return {};
 }
 
+// LINT.IfChange(get_visitor_id)
 VisitorId Map::GetVisitorId(Tagged<Map> map) {
   static_assert(kVisitorIdCount <= 256);
 
@@ -267,6 +268,7 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
     case JS_ITERATOR_TAKE_HELPER_TYPE:
     case JS_ITERATOR_DROP_HELPER_TYPE:
     case JS_ITERATOR_FLAT_MAP_HELPER_TYPE:
+    case JS_ITERATOR_CONCAT_HELPER_TYPE:
     case JS_ITERATOR_PROTOTYPE_TYPE:
     case JS_MAP_ITERATOR_PROTOTYPE_TYPE:
     case JS_MAP_KEY_ITERATOR_TYPE:
@@ -413,6 +415,9 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
     case PROTOTYPE_INFO_TYPE:
       return kVisitPrototypeInfo;
 
+    case PROTOTYPE_SHARED_CLOSURE_INFO_TYPE:
+      return kVisitPrototypeSharedClosureInfo;
+
     case DEBUG_INFO_TYPE:
       return kVisitDebugInfo;
 
@@ -488,6 +493,7 @@ VisitorId Map::GetVisitorId(Tagged<Map> map) {
   FATAL("Instance type %s (code %d) not mapped to VisitorId.", name.c_str(),
         instance_type);
 }
+// LINT.ThenChange()
 
 // static
 MaybeObjectDirectHandle Map::WrapFieldType(DirectHandle<FieldType> type) {
@@ -646,20 +652,25 @@ Map::FieldCounts Map::GetFieldCounts() const {
 }
 
 void Map::DeprecateTransitionTree(Isolate* isolate) {
+  DCHECK(CanBeDeprecated());
+  return DeprecateTransitionTreeImpl(isolate);
+}
+
+void Map::DeprecateTransitionTreeImpl(Isolate* isolate) {
   if (is_deprecated()) return;
   DisallowGarbageCollection no_gc;
   ReadOnlyRoots roots(isolate);
   TransitionsAccessor transitions(isolate, *this);
   transitions.ForEachTransition(
-      &no_gc, [&](Tagged<Map> map) { map->DeprecateTransitionTree(isolate); },
+      &no_gc,
+      [&](Tagged<Map> map) { map->DeprecateTransitionTreeImpl(isolate); },
       [&](Tagged<Map> map) {
         if (v8_flags.move_prototype_transitions_first) {
-          map->DeprecateTransitionTree(isolate);
+          map->DeprecateTransitionTreeImpl(isolate);
         }
       },
       nullptr);
   DCHECK(!IsFunctionTemplateInfo(constructor_or_back_pointer()));
-  DCHECK(CanBeDeprecated());
   set_is_deprecated(true);
   if (v8_flags.log_maps) {
     LOG(isolate, MapEvent("Deprecate", direct_handle(*this, isolate), {}));
@@ -1280,6 +1291,13 @@ Handle<Map> Map::RawCopy(Isolate* isolate, DirectHandle<Map> src_handle,
     }
     // Same as bit_field comment above.
     raw->set_bit_field3(new_bit_field3);
+    if (v8_flags.proto_assign_seq_lazy_func_opt) {
+      if (Tagged<PrototypeSharedClosureInfo> infos;
+          src_handle->TryGetPrototypeSharedClosureInfo(&infos)) {
+        raw->SetPrototypeSharedClosureInfo(infos);
+      }
+    }
+
     raw->clear_padding();
   }
   DirectHandle<JSPrototype> prototype(src_handle->prototype(), isolate);
@@ -1574,6 +1592,22 @@ Handle<Map> Map::CopyReplaceDescriptors(
     DirectHandle<DescriptorArray> descriptors, TransitionFlag flag,
     MaybeDirectHandle<Name> maybe_name, const char* reason,
     TransitionKindFlag transition_kind) {
+  // Special transitions need to pass an InitMap function to initialize the map
+  // before inserting it into the transition tree.
+  CHECK_IMPLIES(flag == INSERT_TRANSITION,
+                transition_kind == PROPERTY_TRANSITION ||
+                    transition_kind == SIMPLE_PROPERTY_TRANSITION);
+  return CopyReplaceDescriptors(
+      isolate, map, descriptors, flag, [&](Handle<Map>) {}, maybe_name, reason,
+      transition_kind);
+}
+
+template <typename InitMapCb>
+Handle<Map> Map::CopyReplaceDescriptors(
+    Isolate* isolate, DirectHandle<Map> map,
+    DirectHandle<DescriptorArray> descriptors, TransitionFlag flag,
+    const InitMapCb& InitMap, MaybeDirectHandle<Name> maybe_name,
+    const char* reason, TransitionKindFlag transition_kind) {
   DCHECK(descriptors->IsSortedNoDuplicates());
 
   Handle<Map> result = CopyDropDescriptors(isolate, map);
@@ -1585,15 +1619,16 @@ Handle<Map> Map::CopyReplaceDescriptors(
     result->set_may_have_interesting_properties(true);
   }
 
+  bool insert_transition = false;
   if (map->is_prototype_map()) {
     result->InitializeDescriptors(isolate, *descriptors);
   } else {
     if (flag == INSERT_TRANSITION &&
         TransitionsAccessor::CanHaveMoreTransitions(isolate, map)) {
+      insert_transition = true;
       result->InitializeDescriptors(isolate, *descriptors);
 
       DCHECK(!maybe_name.is_null());
-      ConnectTransition(isolate, map, result, name, transition_kind);
       is_connected = true;
     } else if ((transition_kind == PROTOTYPE_TRANSITION &&
                 v8_flags.move_prototype_transitions_first) ||
@@ -1610,6 +1645,10 @@ Handle<Map> Map::CopyReplaceDescriptors(
       descriptors->GeneralizeAllFields(transition_kind == PROTOTYPE_TRANSITION);
       result->InitializeDescriptors(isolate, *descriptors);
     }
+  }
+  InitMap(result);
+  if (insert_transition) {
+    ConnectTransition(isolate, map, result, name, transition_kind);
   }
   if (v8_flags.log_maps && !is_connected) {
     LOG(isolate,
@@ -1866,68 +1905,70 @@ Handle<Map> Map::CopyForPreventExtensions(
       DescriptorArray::CopyUpToAddAttributes(
           isolate, direct_handle(map->instance_descriptors(isolate), isolate),
           num_descriptors, attrs_to_add);
+
+  auto InitMap = [&](Handle<Map> new_map) {
+    new_map->set_is_extensible(false);
+    if (!IsTypedArrayOrRabGsabTypedArrayElementsKind(map->elements_kind())) {
+      ElementsKind new_kind = IsStringWrapperElementsKind(map->elements_kind())
+                                  ? SLOW_STRING_WRAPPER_ELEMENTS
+                                  : DICTIONARY_ELEMENTS;
+      if (!old_map_is_dictionary_elements_kind) {
+        switch (map->elements_kind()) {
+          case PACKED_ELEMENTS:
+            if (attrs_to_add == SEALED) {
+              new_kind = PACKED_SEALED_ELEMENTS;
+            } else if (attrs_to_add == FROZEN) {
+              new_kind = PACKED_FROZEN_ELEMENTS;
+            } else {
+              new_kind = PACKED_NONEXTENSIBLE_ELEMENTS;
+            }
+            break;
+          case PACKED_NONEXTENSIBLE_ELEMENTS:
+            if (attrs_to_add == SEALED) {
+              new_kind = PACKED_SEALED_ELEMENTS;
+            } else if (attrs_to_add == FROZEN) {
+              new_kind = PACKED_FROZEN_ELEMENTS;
+            }
+            break;
+          case PACKED_SEALED_ELEMENTS:
+            if (attrs_to_add == FROZEN) {
+              new_kind = PACKED_FROZEN_ELEMENTS;
+            }
+            break;
+          case HOLEY_ELEMENTS:
+            if (attrs_to_add == SEALED) {
+              new_kind = HOLEY_SEALED_ELEMENTS;
+            } else if (attrs_to_add == FROZEN) {
+              new_kind = HOLEY_FROZEN_ELEMENTS;
+            } else {
+              new_kind = HOLEY_NONEXTENSIBLE_ELEMENTS;
+            }
+            break;
+          case HOLEY_NONEXTENSIBLE_ELEMENTS:
+            if (attrs_to_add == SEALED) {
+              new_kind = HOLEY_SEALED_ELEMENTS;
+            } else if (attrs_to_add == FROZEN) {
+              new_kind = HOLEY_FROZEN_ELEMENTS;
+            }
+            break;
+          case HOLEY_SEALED_ELEMENTS:
+            if (attrs_to_add == FROZEN) {
+              new_kind = HOLEY_FROZEN_ELEMENTS;
+            }
+            break;
+          default:
+            break;
+        }
+      }
+      new_map->set_elements_kind(new_kind);
+    }
+  };
+
   // Do not track transitions during bootstrapping.
   TransitionFlag flag =
       isolate->bootstrapper()->IsActive() ? OMIT_TRANSITION : INSERT_TRANSITION;
-  Handle<Map> new_map =
-      CopyReplaceDescriptors(isolate, map, new_desc, flag, transition_marker,
-                             reason, SPECIAL_TRANSITION);
-  new_map->set_is_extensible(false);
-  if (!IsTypedArrayOrRabGsabTypedArrayElementsKind(map->elements_kind())) {
-    ElementsKind new_kind = IsStringWrapperElementsKind(map->elements_kind())
-                                ? SLOW_STRING_WRAPPER_ELEMENTS
-                                : DICTIONARY_ELEMENTS;
-    if (!old_map_is_dictionary_elements_kind) {
-      switch (map->elements_kind()) {
-        case PACKED_ELEMENTS:
-          if (attrs_to_add == SEALED) {
-            new_kind = PACKED_SEALED_ELEMENTS;
-          } else if (attrs_to_add == FROZEN) {
-            new_kind = PACKED_FROZEN_ELEMENTS;
-          } else {
-            new_kind = PACKED_NONEXTENSIBLE_ELEMENTS;
-          }
-          break;
-        case PACKED_NONEXTENSIBLE_ELEMENTS:
-          if (attrs_to_add == SEALED) {
-            new_kind = PACKED_SEALED_ELEMENTS;
-          } else if (attrs_to_add == FROZEN) {
-            new_kind = PACKED_FROZEN_ELEMENTS;
-          }
-          break;
-        case PACKED_SEALED_ELEMENTS:
-          if (attrs_to_add == FROZEN) {
-            new_kind = PACKED_FROZEN_ELEMENTS;
-          }
-          break;
-        case HOLEY_ELEMENTS:
-          if (attrs_to_add == SEALED) {
-            new_kind = HOLEY_SEALED_ELEMENTS;
-          } else if (attrs_to_add == FROZEN) {
-            new_kind = HOLEY_FROZEN_ELEMENTS;
-          } else {
-            new_kind = HOLEY_NONEXTENSIBLE_ELEMENTS;
-          }
-          break;
-        case HOLEY_NONEXTENSIBLE_ELEMENTS:
-          if (attrs_to_add == SEALED) {
-            new_kind = HOLEY_SEALED_ELEMENTS;
-          } else if (attrs_to_add == FROZEN) {
-            new_kind = HOLEY_FROZEN_ELEMENTS;
-          }
-          break;
-        case HOLEY_SEALED_ELEMENTS:
-          if (attrs_to_add == FROZEN) {
-            new_kind = HOLEY_FROZEN_ELEMENTS;
-          }
-          break;
-        default:
-          break;
-      }
-    }
-    new_map->set_elements_kind(new_kind);
-  }
-  return new_map;
+  return CopyReplaceDescriptors(isolate, map, new_desc, flag, InitMap,
+                                transition_marker, reason, SPECIAL_TRANSITION);
 }
 
 namespace {
@@ -2390,8 +2431,16 @@ DirectHandle<PrototypeInfo> Map::GetOrCreatePrototypeInfo(
       return direct_handle(prototype_info, isolate);
     }
   }
+
   DirectHandle<PrototypeInfo> proto_info =
       isolate->factory()->NewPrototypeInfo();
+
+  if (v8_flags.proto_assign_seq_lazy_func_opt) {
+    if (Tagged<PrototypeSharedClosureInfo> closure_infos;
+        prototype->map()->TryGetPrototypeSharedClosureInfo(&closure_infos)) {
+      proto_info->set_prototype_shared_closure_info(closure_infos);
+    }
+  }
   prototype->map()->set_prototype_info(*proto_info, kReleaseStore);
   return proto_info;
 }
@@ -2407,6 +2456,14 @@ DirectHandle<PrototypeInfo> Map::GetOrCreatePrototypeInfo(
   }
   DirectHandle<PrototypeInfo> proto_info =
       isolate->factory()->NewPrototypeInfo();
+
+  if (v8_flags.proto_assign_seq_lazy_func_opt) {
+    if (Tagged<PrototypeSharedClosureInfo> closure_infos;
+        prototype_map->TryGetPrototypeSharedClosureInfo(&closure_infos)) {
+      proto_info->set_prototype_shared_closure_info(closure_infos);
+    }
+  }
+
   prototype_map->set_prototype_info(*proto_info, kReleaseStore);
   return proto_info;
 }

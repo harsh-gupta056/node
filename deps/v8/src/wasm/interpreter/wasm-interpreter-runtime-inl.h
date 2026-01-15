@@ -13,6 +13,7 @@
 // Include the non-inl header before the rest of the headers.
 
 #include "src/execution/arguments-inl.h"
+#include "src/heap/incremental-marking.h"
 #include "src/objects/objects-inl.h"
 #include "src/wasm/interpreter/wasm-interpreter-inl.h"
 #include "src/wasm/wasm-objects.h"
@@ -55,7 +56,7 @@ inline DirectHandle<Object> WasmInterpreterRuntime::GetGlobalRef(
     uint32_t index) const {
   // This function assumes that it is executed in a HandleScope.
   const wasm::WasmGlobal& global = module_->globals[index];
-  DCHECK(global.type.is_reference());
+  DCHECK(global.type.is_ref());
   Tagged<FixedArray> global_buffer;  // The buffer of the global.
   uint32_t global_index = 0;         // The index into the buffer.
   std::tie(global_buffer, global_index) =
@@ -67,7 +68,7 @@ inline void WasmInterpreterRuntime::SetGlobalRef(
     uint32_t index, DirectHandle<Object> ref) const {
   // This function assumes that it is executed in a HandleScope.
   const wasm::WasmGlobal& global = module_->globals[index];
-  DCHECK(global.type.is_reference());
+  DCHECK(global.type.is_ref());
   Tagged<FixedArray> global_buffer;  // The buffer of the global.
   uint32_t global_index = 0;         // The index into the buffer.
   std::tie(global_buffer, global_index) =
@@ -157,6 +158,26 @@ inline bool WasmInterpreterRuntime::WasmStackCheck(
     const uint8_t* current_bytecode, const uint8_t*& code) {
   StackLimitCheck stack_check(isolate_);
 
+  // Counter for periodic GC checks during wasmgc execution.
+  // The interpreter's allocation pattern causes V8's GC heuristics to inflate
+  // limits, preventing major GC from triggering. We periodically check if
+  // old_space is getting large and trigger GC if needed.
+  // This check is skipped entirely if no wasmgc allocations have been made.
+  // Configure via --drumbrake-gc-check-interval and --drumbrake-gc-threshold.
+  static thread_local int stack_check_gc_counter_ = 0;
+
+  if (V8_UNLIKELY(current_thread_->wasmgc_allocated_bytes()) > 0) {
+    if (++stack_check_gc_counter_ >= v8_flags.drumbrake_gc_check_interval) {
+      stack_check_gc_counter_ = 0;
+      if (isolate_->heap()->OldGenerationSizeOfObjects() >
+          v8_flags.drumbrake_gc_threshold) {
+        isolate_->heap()->CollectGarbage(
+            OLD_SPACE, GarbageCollectionReason::kAllocationLimit);
+        current_thread_->ResetWasmGCAllocationCounter();
+      }
+    }
+  }
+
   current_frame_.current_bytecode_ = current_bytecode;
   current_thread_->SetCurrentFrame(current_frame_);
 
@@ -164,14 +185,14 @@ inline bool WasmInterpreterRuntime::WasmStackCheck(
     if (stack_check.HasOverflowed()) {
       SealHandleScope shs(isolate_);
       current_frame_.current_function_ = nullptr;
-      SetTrap(TrapReason::kTrapUnreachable, code);
+      SetTrap(MessageTemplate::kWasmTrapUnreachable, code);
       isolate_->StackOverflow();
       return false;
     }
     if (isolate_->stack_guard()->HasTerminationRequest()) {
       SealHandleScope shs(isolate_);
       current_frame_.current_function_ = nullptr;
-      SetTrap(TrapReason::kTrapUnreachable, code);
+      SetTrap(MessageTemplate::kWasmTrapUnreachable, code);
       isolate_->TerminateExecution();
       return false;
     }
@@ -184,7 +205,7 @@ inline bool WasmInterpreterRuntime::WasmStackCheck(
                           v8_flags.drumbrake_fuzzer_timeout_limit_ms))) {
     SealHandleScope shs(isolate_);
     current_frame_.current_function_ = nullptr;
-    SetTrap(TrapReason::kTrapUnreachable, code);
+    SetTrap(MessageTemplate::kWasmTrapUnreachable, code);
     return false;
   }
 

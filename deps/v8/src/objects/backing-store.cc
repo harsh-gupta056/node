@@ -308,19 +308,12 @@ std::unique_ptr<BackingStore> BackingStore::TryAllocateAndPartiallyCommitMemory(
   // For accounting purposes, whether a GC was necessary.
   bool did_retry = false;
 
-  // A helper to try running a function up to 3 times, executing a GC
-  // if the first and second attempts failed.
   auto gc_retry = [&](const std::function<bool()>& fn) {
-    for (int i = 0; i < 3; i++) {
-      if (fn()) return true;
-      // Collect garbage and retry.
-      did_retry = true;
-      if (isolate != nullptr) {
-        isolate->heap()->MemoryPressureNotification(
-            MemoryPressureLevel::kCritical, true);
-      }
-    }
-    return false;
+    if (fn()) return true;
+    // Collect garbage and retry.
+    did_retry = true;
+    return isolate->heap()->allocator()->RetryCustomAllocate(
+        fn, internal::AllocationType::kOld);
   };
 
   size_t byte_capacity = maximum_pages * page_size;
@@ -593,7 +586,6 @@ void BackingStore::UpdateSharedWasmMemoryObjects(Isolate* isolate) {
 
 void BackingStore::MakeWasmMemoryResizableByJS(bool resizable) {
   DCHECK(is_wasm_memory());
-  DCHECK(!is_shared());
   if (resizable) {
     set_flag(kIsResizableByJs);
   } else {
@@ -896,23 +888,27 @@ void GlobalBackingStoreRegistry::UpdateSharedWasmMemoryObjects(
   // We call here from the stack guard at loop back edges, where we don't want
   // GC to get in the way of loop-related compiler optimizations.
   DisallowHeapAllocation no_gc;
-  HandleScope scope(isolate);
-  DirectHandle<WeakArrayList> shared_wasm_memories =
-      isolate->factory()->shared_wasm_memories();
+  SealHandleScope seal_handle_scope{isolate};
+  Tagged<WeakArrayList> shared_wasm_memories =
+      Cast<WeakArrayList>(isolate->root(RootIndex::kSharedWasmMemories));
 
   for (int i = 0, e = shared_wasm_memories->length(); i < e; ++i) {
     Tagged<HeapObject> obj;
     if (!shared_wasm_memories->Get(i).GetHeapObject(&obj)) continue;
 
     Tagged<WasmMemoryObject> memory_object = Cast<WasmMemoryObject>(obj);
+
     memory_object->UpdateInstances(isolate);
-    if (!memory_object->array_buffer()->is_resizable_by_js()) {
-      // We need a new JSSharedArrayBuffer, but we can't allocate right now,
-      // so just make a note that the getter for it will have to allocate it
-      // on demand next time it's called.
+    if (Tagged<JSArrayBuffer> shared_ab;
+        TryCast<JSArrayBuffer>(memory_object->array_buffer(), &shared_ab) &&
+        !shared_ab->is_resizable_by_js()) {
+      // Clear the JSArrayBuffer such that we allocate a fresh one on the next
+      // access. Check that the stored backing store is correct, because that
+      // will be used to create the new JSArrayBuffer.
       // TODO(jkummerow): Wouldn't it be nice to only refresh those array
       // buffers whose associated Wasm memory actually grew?
-      memory_object->set_needs_new_buffer(true);
+      DCHECK_EQ(shared_ab->GetBackingStore(), memory_object->backing_store());
+      memory_object->set_array_buffer(ReadOnlyRoots{isolate}.undefined_value());
     }
   }
 }

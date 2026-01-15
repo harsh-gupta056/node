@@ -17,6 +17,8 @@
 
 namespace v8::internal {
 
+using JSTransitionableReceiver = UnionOf<JSObject, JSProxy>;
+
 class PropertyKey {
  public:
   inline PropertyKey(Isolate* isolate, double index);
@@ -174,7 +176,7 @@ class V8_EXPORT_PRIVATE LookupIterator final {
   // any integer for JSTypedArrays).
   inline bool IsElement(Tagged<JSReceiver> object) const;
 
-  inline bool IsPrivateName() const;
+  inline bool IsAnyPrivateName() const;
 
   bool IsFound() const { return state_ != NOT_FOUND; }
   void Next();
@@ -194,6 +196,9 @@ class V8_EXPORT_PRIVATE LookupIterator final {
   inline DirectHandle<PropertyCell> transition_cell() const;
   template <class T>
   inline DirectHandle<T> GetHolder() const;
+  // Returns holder object suitable for Api callbacks - in case the holder is
+  // JSGlobalObject returns respective JSGlobalProxy.
+  Tagged<JSObject> GetHolderForApi() const;
 
   DirectHandle<JSAny> lookup_start_object() const {
     return lookup_start_object_;
@@ -212,13 +217,14 @@ class V8_EXPORT_PRIVATE LookupIterator final {
   /* PROPERTY */
   inline bool ExtendingNonExtensible(DirectHandle<JSReceiver> receiver);
   void PrepareForDataProperty(DirectHandle<Object> value);
-  void PrepareTransitionToDataProperty(DirectHandle<JSReceiver> receiver,
-                                       DirectHandle<Object> value,
-                                       PropertyAttributes attributes,
-                                       StoreOrigin store_origin);
+  void PrepareTransitionToDataProperty(
+      DirectHandle<JSTransitionableReceiver> receiver,
+      DirectHandle<Object> value, PropertyAttributes attributes,
+      StoreOrigin store_origin);
   inline bool IsCacheableTransition();
   V8_WARN_UNUSED_RESULT Maybe<bool> ApplyTransitionToDataProperty(
-      DirectHandle<JSReceiver> receiver, Maybe<ShouldThrow> should_throw);
+      DirectHandle<JSTransitionableReceiver> receiver,
+      Maybe<ShouldThrow> should_throw);
   void ReconfigureDataProperty(DirectHandle<Object> value,
                                PropertyAttributes attributes);
   void Delete();
@@ -282,8 +288,12 @@ class V8_EXPORT_PRIVATE LookupIterator final {
 
  private:
   friend PropertyKey;
-
   static const size_t kInvalidIndex = std::numeric_limits<size_t>::max();
+
+  constexpr size_t AssumeValidIndex(size_t index) {
+    V8_ASSUME(index != kInvalidIndex);
+    return index;
+  }
 
   bool LookupCachedProperty(DirectHandle<AccessorPair> accessor);
   inline LookupIterator(Isolate* isolate, DirectHandle<JSAny> receiver,
@@ -358,6 +368,7 @@ class V8_EXPORT_PRIVATE LookupIterator final {
 
   static inline Configuration ComputeConfiguration(Isolate* isolate,
                                                    Configuration configuration,
+                                                   size_t index,
                                                    DirectHandle<Name> name);
 
   Tagged<JSReceiver> GetRootForNonJSReceiver() const;
